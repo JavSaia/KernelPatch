@@ -7,6 +7,11 @@ name: Build kpimg
 
 on:
   workflow_dispatch:
+  # A workflow_dispatch-only file cannot be triggered through the API/UI while
+  # it lives on a non-default branch, so the build branch pushes trigger it too.
+  push:
+    branches:
+      - ci/kpimg-build
 
 jobs:
   kpimg:
