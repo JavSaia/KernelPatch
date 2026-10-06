@@ -1,0 +1,46 @@
+name: Build kpimg
+
+# Minimal builder for the patched kernel image: unlike build.yml it does not
+# build the kptools/kpatch binaries or the LKM matrix, it only produces the raw
+# kpimg binaries (android + linux) that APatch downloads as `kpimg-android`.
+# Uses the same bare-metal toolchain as build.yml so the output is comparable.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  kpimg:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Compiler
+        run: |
+          curl -sSL -o arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          tar -Jxf arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+
+      - name: Build kpimg
+        run: |
+          export TARGET_COMPILE=$PWD/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-
+          cd kernel
+
+          export ANDROID=1
+          make hdr kpimg
+          cp kpimg kpimg-android
+          make clean
+
+          unset ANDROID
+          make hdr kpimg
+          cp kpimg kpimg-linux
+
+          sha256sum kpimg-android kpimg-linux
+          ls -l kpimg-android kpimg-linux
+
+      - name: Upload kpimg
+        uses: actions/upload-artifact@v4
+        with:
+          name: kpimg-patched
+          path: |
+            kernel/kpimg-android
+            kernel/kpimg-linux
