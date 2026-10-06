@@ -186,22 +186,25 @@ static void put_u32_le(unsigned char *dst, u32 value)
 
 /*
  * Values a clean, enforcing device is expected to expose in
- * /sys/fs/selinux/status.  On modern kernels a policy reload bumps policyload
- * and the sequence is nonzero; older kernels stay at the boot-time 0/0.
+ * /sys/fs/selinux/status.  All three seqno-looking values we publish (this
+ * sequence, this policyload and the access answers' avd.seqno) come from the
+ * same runtime counter, so the relations a real kernel always satisfies --
+ * policyload >= 1 once the policy has been loaded, sequence > policyload, and
+ * access seqno == policyload -- hold by construction.
+ *
+ * That was not the case before: on < 6.7 the page advertised 0/0 (a state a
+ * booted enforcing device can never be in, since the policy load alone bumps
+ * policyload to >= 1) while access queries answered seqno 1, and on >= 6.7 the
+ * hardcoded 4/1 pair disagreed with the load count of the boot it was running
+ * on.  Both are exactly the "status.sequence/policyload" + "access seqno"
+ * findings the on-device detectors report.
  */
 static void fill_fake_status_bytes(void)
 {
-    u32 seq, pload;
+    u32 pload = selinux_sepolicy_clean_policyload();
+    u32 seq = selinux_sepolicy_clean_seq();
 
-    if (kver >= VERSION(6, 7, 0)) {
-        seq = 4;
-        pload = 1;
-    } else {
-        seq = 0;
-        pload = 0;
-    }
-    /* access-query responses report the same seqno (selinux_sepolicy_clean_seq). */
-    seq = selinux_sepolicy_clean_seq();
+    if (seq <= pload) seq = pload + 1; /* a stale/equal pair still looks forged */
 
     lib_memset(fake_status_bytes, 0, sizeof(fake_status_bytes));
     put_u32_le(fake_status_bytes + 0, KP_SELINUX_KERNEL_STATUS_VERSION);
@@ -277,6 +280,47 @@ static int kp_avc_check(u32 tsid, u16 tclass, u32 requested)
 
 /* ---- /sys/fs/selinux/context handler ---- */
 
+/*
+ * Live fallback for queries the clean snapshot cannot resolve.
+ *
+ * A context that the pre-root policy does not contain is a type the manager
+ * added (magisk / ksu / apatch / ...).  Answering those with the stock
+ * "unknown context" error is what the on-device detectors report as
+ * "suspicious SELinux context/rule keyword": the running system plainly
+ * carries such labels -- a root shell reads u:r:magisk:s0 out of
+ * /proc/self/attr/current, the manager's processes are visible -- while the
+ * policy claims the names do not exist anywhere.  That contradiction is the
+ * finding itself (e.g. the untrusted_app -> magisk binder probe), so it cannot
+ * be "answered more carefully"; the only way to drop it is to not contradict
+ * the rest of the system.
+ *
+ * The stock handler therefore answers when, and only when, the clean copy
+ * cannot resolve the query.  Nothing the clean copy CAN answer changes:
+ * modifications the manager applied to stock types still come from the
+ * pre-root policy, which is what the feature exists for.  A context that
+ * exists nowhere (garbage / randomized type-name scanning) still gets the
+ * stock -EINVAL because the live handler fails as well.
+ *
+ * Switch: selinux_hide_control(6) = fallback off, (7) = back on (default),
+ * (-3) = query.  Turn it off if a caller must be answered from the clean
+ * snapshot even when that means leaking "this policy knows nothing about the
+ * manager's types".
+ */
+static bool selinux_hide_live_fallback = true;
+
+static ssize_t kp_live_answer(const char *what, uid_t uid, sel_write_op_fn orig, struct file *file, char *buf,
+                              size_t size, ssize_t clean_err)
+{
+    ssize_t length;
+
+    if (!selinux_hide_live_fallback || !orig) return clean_err;
+
+    length = orig(file, buf, size);
+    if (length <= 0) return clean_err; /* the live policy does not know it either */
+    kp_qlog(what, uid, buf, (size_t)length);
+    return length;
+}
+
 static ssize_t my_write_context(struct file *file, char *buf, size_t size)
 {
     uid_t uid = current_uid();
@@ -295,16 +339,16 @@ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
 
     /* KernelSU my_write_context: answer entirely from the clean snapshot.
      * The stock handler is never run for apps, so the live (patched) sidtab
-     * can never leak into the canonical answer -- no symbol-redirect scope,
-     * no silent fallback to the live policy. */
+     * can never leak into the canonical answer -- except for contexts the clean
+     * policy does not know at all, see kp_live_answer(). */
     length = kp_avc_check(KP_SECINITSID_SECURITY, KP_SECCLASS_SECURITY, KP_SECURITY__CHECK_CONTEXT);
     if (length) return length;
 
     length = selinux_sepolicy_context_to_sid(buf, size, &sid, KP_GFP_KERNEL);
-    if (length) return length;
+    if (length) goto live_answer;
 
     length = selinux_sepolicy_sid_to_context(sid, &canon, &len);
-    if (length) return length;
+    if (length) goto live_answer;
 
     if (len > KP_SIMPLE_TRANSACTION_LIMIT) {
         length = -ERANGE;
@@ -316,6 +360,9 @@ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
 out:
     if (canon && kfunc(kfree)) kfunc(kfree)(canon);
     return length;
+
+live_answer:
+    return kp_live_answer("context_answer_live", uid, orig_context_write, file, buf, size, length);
 }
 
 /* ---- /sys/fs/selinux/access handler ---- */
@@ -341,27 +388,34 @@ static ssize_t my_write_access(struct file *file, char *buf, size_t size)
     /* KernelSU my_write_access: compute the whole decision against the clean
      * snapshot and report the stock seqno.  This uniformly covers the
      * DirtySepolicy avd.seqno probe (untrusted_app x untrusted_app, class 0):
-     * its answer is produced by the pre-root policy with seqno 1, so no
-     * response patching or special case is needed any more. */
+     * its answer is produced by the pre-root policy with the same seqno the
+     * status page advertises as policyload.
+     *
+     * Queries naming a context the clean policy does not have (untrusted_app ->
+     * magisk binder and friends) are handed to the stock handler instead; see
+     * kp_live_answer(). */
     length = kp_avc_check(KP_SECINITSID_SECURITY, KP_SECCLASS_SECURITY, KP_SECURITY__COMPUTE_AV);
     if (length) return length;
 
     if (sscanf(buf, "%255s %255s %hu", scon, tcon, &tclass) != 3) return -EINVAL;
 
     length = selinux_sepolicy_context_str_to_sid(scon, &ssid, KP_GFP_KERNEL);
-    if (length) return length;
+    if (length) goto live_answer;
 
     length = selinux_sepolicy_context_str_to_sid(tcon, &tsid, KP_GFP_KERNEL);
-    if (length) return length;
+    if (length) goto live_answer;
 
     lib_memset(&avd, 0, sizeof(avd));
     avd.auditdeny = 0xffffffff;
     selinux_sepolicy_compute_av_user(ssid, tsid, tclass, &avd);
-    avd.seqno = KP_AVD_CLEAN_SEQNO;
+    avd.seqno = selinux_sepolicy_clean_policyload();
 
     return snprintf(buf, size, "%x %x %x %x %u %x",
                     avd.allowed, 0xffffffff, avd.auditallow, avd.auditdeny,
                     avd.seqno, avd.flags);
+
+live_answer:
+    return kp_live_answer("access_answer_live", uid, orig_access_write, file, buf, size, length);
 }
 
 /* ---- setprocattr handler ---- */
@@ -380,7 +434,15 @@ static int my_setprocattr(const char *name, void *value, size_t size)
 
     /* KernelSU my_setprocattr: apps may only transition to contexts that the
      * CLEAN policy knows; a root-manager context is rejected here, before the
-     * stock handler ever consults the patched live policy. */
+     * stock handler ever consults the patched live policy.
+     *
+     * This is deliberately NOT given the kp_live_answer() fallback the query
+     * interfaces get: a rejected transition only has to look like a clean
+     * device, and it does -- the -EINVAL we return is byte-identical to what a
+     * device without any manager returns for an unknown context, so the probe
+     * cannot tell the two apart.  Letting the live policy decide instead would
+     * be far more visible, since the domain a process switched into shows up in
+     * every /proc/<pid>/attr/current afterwards. */
     if (uid < 10000 || lib_strcmp(name, "current")) goto call_orig;
 
     {
@@ -487,6 +549,13 @@ static int my_sel_mmap_handle_status(struct file *filp,
     }
 
 real_page:
+    /* Never hand an app the real status page while the feature is on: mapping
+     * it would expose the live permissive flag / policyload the fake page
+     * exists to hide, which is a far louder signal than a failed mmap. */
+    if (selinux_hide_enabled && uid >= 10000) {
+        logkfi("selinux_hide: status mmap refused for uid=%u (no fake page)\n", (unsigned int)uid);
+        return -ENOMEM;
+    }
     return orig_sel_mmap_handle_status(filp, vma);
 }
 
@@ -735,6 +804,16 @@ long selinux_hide_control(int state)
     switch (state) {
     case -2:
         return selinux_hide_query_log;
+    case -3:
+        return selinux_hide_live_fallback ? 1 : 0;
+    case 6:
+        selinux_hide_live_fallback = false;
+        logkfi("selinux_hide: live-policy fallback off\n");
+        return 0;
+    case 7:
+        selinux_hide_live_fallback = true;
+        logkfi("selinux_hide: live-policy fallback on\n");
+        return 0;
     case 2:
         selinux_hide_query_log = KP_QLOG_OFF;
         logkfi("query log: off\n");

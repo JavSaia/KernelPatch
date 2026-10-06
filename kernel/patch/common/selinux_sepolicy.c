@@ -562,6 +562,21 @@ static void *g_clean_blob;      /* last marker-free policy blob (as loaded) */
 static size_t g_clean_blob_len;
 static bool g_clean_locked;     /* a marker-carrying load was seen */
 
+/* How many marker-free (boot) policy loads we have seen, and the value frozen
+ * when the snapshot was taken.  These feed every seqno-looking value reported
+ * to apps (see selinux_sepolicy.h): the fake status page's policyload and
+ * sequence and the access answers' avd.seqno.  Counting the loads instead of
+ * hardcoding a pair is what keeps them consistent with each other and with the
+ * number of policy epochs this particular boot really went through. */
+static u32 g_clean_loads;
+static u32 g_clean_loads_frozen;
+
+/* Fallback when the capture hook never resolved the load symbol.  Never 0: a
+ * booted enforcing device has loaded the policy at least once, and
+ * policyload == 0 is precisely the impossible-looking value detectors probe
+ * for. */
+#define KP_CLEAN_LOADS_DEFAULT 2
+
 static void kp_capture_policy_load(uint64_t ret)
 {
     void *data = NULL;
@@ -592,6 +607,7 @@ static void kp_capture_policy_load(uint64_t ret)
         log_boot("selinux_sepolicy: loaded policy len %zu carries root markers, keeping the %zu byte clean blob\n",
                  len, g_clean_blob_len);
     } else {
+        if (!g_clean_loads_frozen) g_clean_loads++;
         copy = kp_vmalloc(len);
         if (copy) {
             lib_memcpy(copy, data, len);
@@ -745,6 +761,14 @@ int selinux_sepolicy_snapshot(void)
 {
     if (!selinux_sepolicy_supported()) return -EOPNOTSUPP;
     if (g_backup_ready) return 0;
+
+    /* Freeze the reported load count here: this is the moment the clean policy
+     * is taken, so the value is exactly what a non-rooted boot of this device
+     * would have left behind.  Anything the manager loads afterwards must not
+     * move it (a bumped policyload is the detector's "policy reloaded" tell). */
+    if (!g_clean_loads_frozen) g_clean_loads_frozen = g_clean_loads;
+    log_boot("selinux_sepolicy: clean policy loads seen: %u\n", g_clean_loads_frozen);
+
     return kp_dup_sepolicy();
 }
 
@@ -839,7 +863,10 @@ static void kp_compute_av_user_with_policy(u32 ssid, u32 tsid, u16 tclass, struc
     avd->allowed = 0;
     avd->auditallow = 0;
     avd->auditdeny = 0xffffffff;
-    avd->seqno = KP_AVD_CLEAN_SEQNO;
+    /* Same counter as the fake status page's policyload: on a real kernel
+     * avd.seqno IS ss->latest_granting, the value selinux_status_update_
+     * policyload() put in the status page, so the two must never disagree. */
+    avd->seqno = selinux_sepolicy_clean_policyload();
     avd->flags = 0;
 
     se = kp_sidtab_search_core(sidtab, ssid, 0);
@@ -894,10 +921,23 @@ void selinux_sepolicy_compute_av_user(u32 ssid, u32 tsid, u16 tclass, struct av_
     kp_compute_av_user_with_policy(ssid, tsid, tclass, avd);
 }
 
+/* ---- values reported to apps (see selinux_sepolicy.h) ---- */
+
+u32 selinux_sepolicy_clean_policyload(void)
+{
+    u32 loads = g_clean_loads_frozen ? g_clean_loads_frozen : g_clean_loads;
+
+    if (!loads) loads = KP_CLEAN_LOADS_DEFAULT;
+    return loads;
+}
+
 u32 selinux_sepolicy_clean_seq(void)
 {
-    if (kver >= VERSION(6, 7, 0)) return 4;
-    return 0;
+    /* One sequence bump per policyload, plus the complete_init setenforce and
+     * init's own enforce write: policyload + 2.  A clean two-load boot
+     * therefore reads 4/2 -- the sequence value the old code hardcoded for
+     * >= 6.7 (4) with a policyload (1) that contradicted it. */
+    return selinux_sepolicy_clean_policyload() + 2;
 }
 
 /* ---- init ---- */
