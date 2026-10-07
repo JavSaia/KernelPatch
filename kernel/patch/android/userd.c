@@ -77,25 +77,45 @@ struct trusted_manager_entry {
     const uint8_t digest[TRUSTED_MANAGER_DIGEST_LEN];
 };
 
+/*
+ * The manager identities this image trusts.
+ *
+ * Each digest is the SHA-256 of the DER of the signing certificate of the
+ * manager APK -- byte for byte what `apksigner verify --print-certs <apk>`
+ * prints as "certificate SHA-256 digest".  apk_matches_trusted_signature()
+ * reads that certificate out of the APK's v2/v3 signing block and compares, so
+ * only an APK signed by one of these keys is ever accepted as the manager:
+ * is_trusted_manager_uid_android() stays false for any other build, the
+ * supercall hook drops the call, and the app reports the kernel as not
+ * installed.
+ *
+ * The defaults are the upstream release keys.  A build that ships its own
+ * manager APK must be compiled with its own digest, e.g.
+ *
+ *   CFLAGS=-DKP_TRUSTED_MANAGER_DIGEST={0xaa,0xbb,...}   (32 bytes, no spaces)
+ *
+ * otherwise the kernel rejects its own app.  Nothing else has to change: the
+ * package name below must match the manager's applicationId.
+ */
+#ifndef KP_TRUSTED_MANAGER_DIGEST
+#define KP_TRUSTED_MANAGER_DIGEST                                                                                 \
+    {                                                                                                             \
+        0xd7, 0x1d, 0xad, 0xc0, 0xca, 0x07, 0xbd, 0xf5, 0x94, 0x38, 0x3b, 0xfb, 0x2a, 0x44, 0x51, 0x34, 0xa0, 0x73,   \
+            0x39, 0xf1, 0x2a, 0x27, 0x04, 0x4a, 0x1b, 0x32, 0x69, 0x81, 0xac, 0xf5, 0xf3, 0x19                         \
+    }
+#endif
+
+#ifndef KP_TRUSTED_MANAGER_DIGEST_ALT
+#define KP_TRUSTED_MANAGER_DIGEST_ALT                                                                             \
+    {                                                                                                             \
+        0xe5, 0x11, 0x33, 0x12, 0x5f, 0xef, 0x56, 0xaa, 0x52, 0x83, 0x91, 0xfc, 0xc2, 0x04, 0x94, 0xeb, 0xb5, 0x38,   \
+            0xbd, 0x8e, 0x09, 0x3d, 0x6c, 0x47, 0x5d, 0x6d, 0x00, 0x2a, 0x7a, 0x12, 0x1a, 0x8f                         \
+    }
+#endif
+
 static const struct trusted_manager_entry trusted_managers[] = {
-    {
-        "me.bmax.apatch",
-        {
-            0xd7, 0x1d, 0xad, 0xc0, 0xca, 0x07, 0xbd, 0xf5,
-            0x94, 0x38, 0x3b, 0xfb, 0x2a, 0x44, 0x51, 0x34,
-            0xa0, 0x73, 0x39, 0xf1, 0x2a, 0x27, 0x04, 0x4a,
-            0x1b, 0x32, 0x69, 0x81, 0xac, 0xf5, 0xf3, 0x19
-        }
-    },
-    {
-        "com.example.apatch",
-        {
-            0xe5, 0x11, 0x33, 0x12, 0x5f, 0xef, 0x56, 0xaa,
-            0x52, 0x83, 0x91, 0xfc, 0xc2, 0x04, 0x94, 0xeb,
-            0xb5, 0x38, 0xbd, 0x8e, 0x09, 0x3d, 0x6c, 0x47,
-            0x5d, 0x6d, 0x00, 0x2a, 0x7a, 0x12, 0x1a, 0x8f
-        }
-    },
+    { "me.bmax.apatch", KP_TRUSTED_MANAGER_DIGEST },
+    { "com.example.apatch", KP_TRUSTED_MANAGER_DIGEST_ALT },
     { "", { 0 } }
 };
 
