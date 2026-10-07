@@ -43,6 +43,10 @@ int selinux_sepolicy_snapshot(void);
 
 bool selinux_sepolicy_backup_ready(void);
 
+/* Serialized pre-manager policy blob (security_read_policy() bytes), for the
+ * /sys/fs/selinux/policy hook. */
+const void *selinux_sepolicy_clean_blob(size_t *len);
+
 /* Query helpers that answer against the deep copy. */
 int selinux_sepolicy_context_to_sid(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp);
 int selinux_sepolicy_sid_to_context(u32 sid, char **scontext, u32 *scontext_len);

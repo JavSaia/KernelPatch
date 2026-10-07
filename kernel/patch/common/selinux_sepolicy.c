@@ -777,6 +777,22 @@ bool selinux_sepolicy_backup_ready(void)
     return g_backup_ready;
 }
 
+/* The captured clean (pre-manager) policy blob: byte-identical to what
+ * security_read_policy() serializes, i.e. to the contents /sys/fs/selinux/policy
+ * hands out.  Serving that to apps keeps a policy dumper in agreement with the
+ * context/access answers (see the policy read hook in selinux_hide.c) instead
+ * of letting it read the manager-patched policy and conclude that our answers
+ * were scrubbed. */
+const void *selinux_sepolicy_clean_blob(size_t *len)
+{
+    if (!g_clean_blob || !g_clean_blob_len) {
+        if (len) *len = 0;
+        return NULL;
+    }
+    if (len) *len = g_clean_blob_len;
+    return g_clean_blob;
+}
+
 /* ---- query helpers against the deep copy ---- */
 
 static struct policydb *kp_backup_policydb(void)
@@ -933,11 +949,16 @@ u32 selinux_sepolicy_clean_policyload(void)
 
 u32 selinux_sepolicy_clean_seq(void)
 {
-    /* One sequence bump per policyload, plus the complete_init setenforce and
-     * init's own enforce write: policyload + 2.  A clean two-load boot
-     * therefore reads 4/2 -- the sequence value the old code hardcoded for
-     * >= 6.7 (4) with a policyload (1) that contradicted it. */
-    return selinux_sepolicy_clean_policyload() + 2;
+    u32 seq = selinux_sepolicy_clean_policyload() + 2;
+
+    /* The status page's sequence is a seqlock counter: the kernel steps it once
+     * before and once after each update, so a settled value is always EVEN.
+     * Detectors read it as such -- an odd value means "mid-update, retry", and
+     * a value that is permanently odd leaves their policyload/seqno comparison
+     * inconclusive instead of clean.  Keep it even and strictly above the
+     * policyload it accompanies. */
+    if (seq & 1) seq++;
+    return seq;
 }
 
 /* ---- init ---- */
